@@ -309,3 +309,11 @@ async function startWorker() {
 }
 
 startWorker();
+const http = require('http');
+const PORT = process.env.PORT || 10000;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Trade engine is running 24/7');
+}).listen(PORT, () => {
+  console.log(`Port listening on ${PORT}`);
+});
