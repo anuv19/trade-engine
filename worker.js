@@ -1,4 +1,5 @@
 const { createClient } = require('@supabase/supabase-js');
+const http = require('http');
 
 const SUPABASE_URL = 'https://datusfnmcqzkutxuxwzr.supabase.co';
 const SUPABASE_SERVICE_KEY = 'sb_secret_A1T0WZQdT6mDz3X4dXrNgw_4yCq9L3i';
@@ -13,6 +14,7 @@ const LIQUIDATION_TAKER_FEE = 0.0005;
 const LIQUIDATION_CLEARANCE_FEE = 0.01;
 
 let isEvaluating = false;
+let lastFundingCheckTime = 0;
 
 // 1. Fetch Binance Live Tickers
 async function getLiveRates() {
@@ -131,7 +133,7 @@ async function processSpotOrders(rates) {
         updated_at: new Date().toISOString()
       }).eq('id', o.id);
 
-      // Record trade history
+      // Record trade history with execution timestamp
       await supabase.from('trade_history').insert({
         user_id: o.user_id,
         market: 'spot',
@@ -286,7 +288,48 @@ async function processFuturesPositions(rates) {
   }
 }
 
-// Main Engine Loop (Every 1000ms)
+// 4. Step 6 Implementation: Automated Funding Fee Engine (Every 8 Hours)
+async function processFundingFees() {
+  const now = Date.now();
+  // Har 10 minute me check karega ki kisi position ko 8 ghante ho gaye ya nahi
+  if (now - lastFundingCheckTime < 10 * 60 * 1000) return;
+  lastFundingCheckTime = now;
+
+  try {
+    const { data: openPos, error } = await supabase
+      .from('open_positions')
+      .select('*')
+      .eq('status', 'OPEN');
+
+    if (error || !openPos || openPos.length === 0) return;
+
+    for (const pos of openPos) {
+      const lastFunding = pos.last_funding_time ? new Date(pos.last_funding_time).getTime() : new Date(pos.created_at).getTime();
+      const eightHoursMs = 8 * 60 * 60 * 1000;
+
+      if (now - lastFunding >= eightHoursMs) {
+        // Binance standard funding rate ~0.01% (0.0001)
+        const fundingRate = 0.0001;
+        const notional = Number(pos.size) * Number(pos.entry_price);
+        const feeAmount = Number((notional * fundingRate).toFixed(4));
+        const prevAcc = Number(pos.accumulated_funding_fee || 0);
+
+        const newAcc = pos.type === 'LONG' ? prevAcc + feeAmount : prevAcc - feeAmount;
+
+        await supabase.from('open_positions').update({
+          accumulated_funding_fee: newAcc,
+          last_funding_time: new Date().toISOString()
+        }).eq('id', pos.id);
+
+        console.log(`[FUNDING FEE APPLIED] Pos ID: ${pos.id} | Fee: ${feeAmount}`);
+      }
+    }
+  } catch (err) {
+    console.error('Funding fee processing error:', err.message);
+  }
+}
+
+// Main Engine Loop (Every 2000ms for High Performance & Safety)
 async function startWorker() {
   console.log('--- 🚀 24/7 BACKGROUND EXECUTION WORKER STARTED ---');
   setInterval(async () => {
@@ -297,7 +340,8 @@ async function startWorker() {
       if (Object.keys(rates).length > 0) {
         await Promise.allSettled([
           processSpotOrders(rates),
-          processFuturesPositions(rates)
+          processFuturesPositions(rates),
+          processFundingFees()
         ]);
       }
     } catch (e) {
@@ -305,11 +349,12 @@ async function startWorker() {
     } finally {
       isEvaluating = false;
     }
-  }, 1000);
+  }, 2000);
 }
 
 startWorker();
-const http = require('http');
+
+// Dummy HTTP Server for Render Port Binding
 const PORT = process.env.PORT || 10000;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
