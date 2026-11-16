@@ -16,32 +16,63 @@ const LIQUIDATION_CLEARANCE_FEE = 0.01;
 let isEvaluating = false;
 let lastFundingCheckTime = 0;
 
-// 1. Fetch Binance Live Tickers
+// 1. Fetch Live Tickers (Multi-Source Fallback for US Cloud Servers like Render)
 async function getLiveRates() {
   const priceMap = {};
+
+  // Primary: Binance Global Vision / Data Endpoint (Never Geoblocked on US Servers)
   try {
-    const [spotRes, futuresRes] = await Promise.all([
-      fetch('https://api.binance.com/api/v3/ticker/price'),
-      fetch('https://fapi.binance.com/fapi/v1/ticker/price')
-    ]);
-
-    const spotData = await spotRes.json();
-    const futuresData = await futuresRes.json();
-
-    if (Array.isArray(spotData)) {
-      spotData.forEach(t => {
-        priceMap[`SPOT_${t.symbol.toUpperCase()}`] = parseFloat(t.price);
-      });
-    }
-
-    if (Array.isArray(futuresData)) {
-      futuresData.forEach(t => {
-        priceMap[`FUT_${t.symbol.toUpperCase()}`] = parseFloat(t.price);
+    const res = await fetch('https://data-api.binance.vision/api/v3/ticker/price');
+    const data = await res.json();
+    if (Array.isArray(data)) {
+      data.forEach(t => {
+        const sym = t.symbol.toUpperCase();
+        const p = parseFloat(t.price);
+        if (p > 0) {
+          priceMap[`SPOT_${sym}`] = p;
+          priceMap[`FUT_${sym}`] = p;
+        }
       });
     }
   } catch (err) {
-    console.error('Binance price fetch error:', err.message);
+    console.error('Binance Vision fetch error:', err.message);
   }
+
+  // Secondary: Binance Futures Direct (If not geoblocked, overrides with exact Futures Mark/Last price)
+  try {
+    const futuresRes = await fetch('https://fapi.binance.com/fapi/v1/ticker/price');
+    const futuresData = await futuresRes.json();
+    if (Array.isArray(futuresData)) {
+      futuresData.forEach(t => {
+        const sym = t.symbol.toUpperCase();
+        const p = parseFloat(t.price);
+        if (p > 0) {
+          priceMap[`FUT_${sym}`] = p;
+        }
+      });
+    }
+  } catch (e) {}
+
+  // Tertiary Fallback: Bybit Public API (If Binance is completely unreachable)
+  if (Object.keys(priceMap).length === 0) {
+    try {
+      const bybitRes = await fetch('https://api.bybit.com/v5/market/tickers?category=linear');
+      const bybitJson = await bybitRes.json();
+      if (bybitJson?.result?.list) {
+        bybitJson.result.list.forEach(t => {
+          const sym = t.symbol.toUpperCase();
+          const p = parseFloat(t.lastPrice);
+          if (p > 0) {
+            priceMap[`SPOT_${sym}`] = p;
+            priceMap[`FUT_${sym}`] = p;
+          }
+        });
+      }
+    } catch (err) {
+      console.error('Bybit fallback fetch error:', err.message);
+    }
+  }
+
   return priceMap;
 }
 
@@ -70,7 +101,6 @@ async function processSpotOrders(rates) {
 
       const tradeFee = Number((Number(o.total) * SPOT_FEE_RATE).toFixed(4));
 
-      // Fetch user profile
       const { data: profile } = await supabase
         .from('profiles')
         .select('*')
@@ -79,7 +109,6 @@ async function processSpotOrders(rates) {
 
       if (!profile) continue;
 
-      // Fetch user coin holdings
       const { data: holding } = await supabase
         .from('spot_holdings')
         .select('*')
@@ -127,13 +156,11 @@ async function processSpotOrders(rates) {
         }
       }
 
-      // Mark order filled
       await supabase.from('spot_orders').update({
         status: 'FILLED',
         updated_at: new Date().toISOString()
       }).eq('id', o.id);
 
-      // Record trade history with execution timestamp
       await supabase.from('trade_history').insert({
         user_id: o.user_id,
         market: 'spot',
@@ -166,32 +193,40 @@ async function processFuturesPositions(rates) {
     if (!livePrice || livePrice <= 0) continue;
 
     const isLong = pos.type === 'LONG';
+    const entryP = Number(pos.entry_price);
+    const lev = Number(pos.leverage || 25);
 
     // A. Pending Futures Limit Order Trigger
     if (pos.status === 'PENDING') {
-      const isLimitTriggered = isLong ? livePrice <= Number(pos.entry_price) : livePrice >= Number(pos.entry_price);
+      const isLimitTriggered = isLong ? livePrice <= entryP : livePrice >= entryP;
       if (isLimitTriggered) {
-        console.log(`[FUTURES LIMIT TRIGGERED] ID: ${pos.id} | ${cleanSym} ${pos.type} @ ${pos.entry_price}`);
+        const calcLiq = isLong
+          ? Number((entryP * (1 - 1 / lev + 0.005)).toFixed(2))
+          : Number((entryP * (1 + 1 / lev - 0.005)).toFixed(2));
+
+        console.log(`[FUTURES LIMIT TRIGGERED] ID: ${pos.id} | ${cleanSym} ${pos.type} @ ${entryP}`);
         await supabase.from('open_positions').update({
           status: 'OPEN',
-          entry_price: livePrice,
+          entry_price: entryP,
+          liquidation_price: Math.max(0, calcLiq),
           last_funding_time: new Date().toISOString()
         }).eq('id', pos.id);
       }
       continue;
     }
 
-    // B. Check Liquidation
-    const liqPrice = Number(pos.liquidation_price || (
+    // B. Check Liquidation (Strict Exact Match with UI Formula)
+    const storedLiq = Number(pos.liquidation_price || 0);
+    const liqPrice = storedLiq > 0 ? storedLiq : (
       isLong
-        ? pos.entry_price * (1 - 1 / pos.leverage + 0.004)
-        : pos.entry_price * (1 + 1 / pos.leverage - 0.004)
-    ));
+        ? entryP * (1 - 1 / lev + 0.005)
+        : entryP * (1 + 1 / lev - 0.005)
+    );
 
     const isLiquidated = isLong ? livePrice <= liqPrice : livePrice >= liqPrice;
 
     if (isLiquidated) {
-      console.log(`[LIQUIDATION] ID: ${pos.id} | ${cleanSym} @ ${livePrice}`);
+      console.log(`[LIQUIDATION EXECUTED] ID: ${pos.id} | ${cleanSym} | Live: ${livePrice} | Liq: ${liqPrice}`);
       await supabase.from('open_positions').delete().eq('id', pos.id);
 
       const notional = Number(pos.size) * livePrice;
@@ -204,7 +239,7 @@ async function processFuturesPositions(rates) {
         symbol: cleanSym,
         pair: cleanSym,
         side: pos.type,
-        entry_price: pos.entry_price,
+        entry_price: entryP,
         close_price: livePrice,
         price: livePrice,
         amount: pos.size,
@@ -213,7 +248,8 @@ async function processFuturesPositions(rates) {
         position_pnl: netLoss,
         realized_pnl: netLoss,
         fee: penaltyFee,
-        leverage: pos.leverage,
+        leverage: lev,
+        open_time: pos.created_at || new Date().toISOString(),
         created_at: new Date().toISOString(),
         is_liquidated: true
       });
@@ -239,7 +275,7 @@ async function processFuturesPositions(rates) {
 
       await supabase.from('open_positions').delete().eq('id', pos.id);
 
-      const priceDiff = isLong ? livePrice - Number(pos.entry_price) : Number(pos.entry_price) - livePrice;
+      const priceDiff = isLong ? livePrice - entryP : entryP - livePrice;
       const rawPnl = Number((priceDiff * Number(pos.size)).toFixed(4));
 
       const notionalExit = Number(pos.size) * livePrice;
@@ -247,9 +283,9 @@ async function processFuturesPositions(rates) {
       const fundingFee = Number(pos.accumulated_funding_fee || 0);
 
       const netPnl = Number((rawPnl - exitFee - fundingFee).toFixed(4));
-      const refundToWallet = Number((Number(pos.margin) + rawPnl - exitFee).toFixed(2));
+      // ISOLATED MARGIN PROTECTION: Refund never goes below 0
+      const refundToWallet = Number(Math.max(0, Number(pos.margin) + rawPnl - exitFee).toFixed(2));
 
-      // Credit User Futures Wallet
       const { data: profile } = await supabase
         .from('profiles')
         .select('futures_balance')
@@ -270,7 +306,7 @@ async function processFuturesPositions(rates) {
         symbol: cleanSym,
         pair: cleanSym,
         side: pos.type,
-        entry_price: pos.entry_price,
+        entry_price: entryP,
         close_price: livePrice,
         price: livePrice,
         amount: pos.size,
@@ -280,7 +316,8 @@ async function processFuturesPositions(rates) {
         realized_pnl: rawPnl,
         fee: exitFee,
         funding_fee: fundingFee,
-        leverage: pos.leverage,
+        leverage: lev,
+        open_time: pos.created_at || new Date().toISOString(),
         created_at: new Date().toISOString(),
         is_liquidated: false
       });
@@ -288,10 +325,9 @@ async function processFuturesPositions(rates) {
   }
 }
 
-// 4. Step 6 Implementation: Automated Funding Fee Engine (Every 8 Hours)
+// 4. Automated Funding Fee Engine (Every 8 Hours)
 async function processFundingFees() {
   const now = Date.now();
-  // Har 10 minute me check karega ki kisi position ko 8 ghante ho gaye ya nahi
   if (now - lastFundingCheckTime < 10 * 60 * 1000) return;
   lastFundingCheckTime = now;
 
@@ -308,7 +344,6 @@ async function processFundingFees() {
       const eightHoursMs = 8 * 60 * 60 * 1000;
 
       if (now - lastFunding >= eightHoursMs) {
-        // Binance standard funding rate ~0.01% (0.0001)
         const fundingRate = 0.0001;
         const notional = Number(pos.size) * Number(pos.entry_price);
         const feeAmount = Number((notional * fundingRate).toFixed(4));
@@ -329,7 +364,7 @@ async function processFundingFees() {
   }
 }
 
-// Main Engine Loop (Every 2000ms for High Performance & Safety)
+// Main Engine Loop (Every 2000ms)
 async function startWorker() {
   console.log('--- 🚀 24/7 BACKGROUND EXECUTION WORKER STARTED ---');
   setInterval(async () => {
@@ -354,7 +389,6 @@ async function startWorker() {
 
 startWorker();
 
-// Dummy HTTP Server for Render Port Binding
 const PORT = process.env.PORT || 10000;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
