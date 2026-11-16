@@ -10,8 +10,8 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
 
 const SPOT_FEE_RATE = 0.001; // 0.1%
 const FUTURES_TAKER_FEE = 0.0003125;
-const LIQUIDATION_TAKER_FEE = 0.0005;
-const LIQUIDATION_CLEARANCE_FEE = 0.01;
+const LIQUIDATION_TAKER_FEE = 0.0005; // 0.05%
+const LIQUIDATION_CLEARANCE_FEE = 0.01; // 1.0%
 
 let isEvaluating = false;
 let lastFundingCheckTime = 0;
@@ -248,6 +248,7 @@ async function processFuturesPositions(rates) {
         position_pnl: netLoss,
         realized_pnl: netLoss,
         fee: penaltyFee,
+        liquidation_fee: penaltyFee,
         leverage: lev,
         open_time: pos.created_at || new Date().toISOString(),
         created_at: new Date().toISOString(),
